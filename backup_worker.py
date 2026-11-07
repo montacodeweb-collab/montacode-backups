@@ -15,6 +15,7 @@ import base64
 import fnmatch
 import ftplib
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -32,6 +33,7 @@ from nacl.public import PrivateKey, SealedBox
 
 CHUNK = 8 * 1024 * 1024  # múltiplo de 256 KB (requisito de las subidas reanudables de Drive)
 STATUS_NAME = 'estado_trabajador.json'
+PROGRESS_NAME = 'progreso_trabajador.json'  # lo que está haciendo ahora; el CMS lo muestra en directo
 SECRETS = []
 
 
@@ -102,7 +104,18 @@ class Drive:
             headers={'Authorization': 'Bearer ' + self.access(), 'Content-Type': f'multipart/related; boundary={boundary}'})
         return json.loads(self._send(req).read())
 
-    def upload_file(self, path, name, parent, mime):
+    def update_bytes(self, file_id, content, mime):
+        req = urllib.request.Request(
+            f'https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media&fields=id', data=content, method='PATCH',
+            headers={'Authorization': 'Bearer ' + self.access(), 'Content-Type': mime})
+        return json.loads(self._send(req, timeout=60).read())
+
+    def delete(self, file_id):
+        req = urllib.request.Request(f'https://www.googleapis.com/drive/v3/files/{file_id}', method='DELETE',
+                                     headers={'Authorization': 'Bearer ' + self.access()})
+        self._send(req, timeout=60)
+
+    def upload_file(self, path, name, parent, mime, on_progress=None):
         """Subida reanudable por trozos de 8 MB; si se corta, pregunta a Drive cuánto tiene y sigue desde ahí."""
         size = os.path.getsize(path)
         req = urllib.request.Request(
@@ -125,6 +138,8 @@ class Drive:
                     if e.code == 308:  # trozo recibido, falta más
                         offset = self._range_end(e.headers)
                         errors = 0
+                        if on_progress and size:
+                            on_progress(offset * 100 // size)
                         continue
                     if e.code in (429, 500, 502, 503, 504) and errors < 6:
                         errors += 1
@@ -153,6 +168,38 @@ class Drive:
             if e.code == 308:
                 return self._range_end(e.headers)
             raise RuntimeError(f'Drive no reconoce la subida ({e.code}).')
+
+
+class Progress:
+    """Deja en Drive un pequeño JSON con lo que se está haciendo (como mucho cada 20 s). Si falla, no pasa nada."""
+
+    def __init__(self, drive, folder, run):
+        self.drive, self.folder, self.run = drive, folder, run
+        self.file_id, self.last = None, 0
+
+    def __call__(self, msg, force=False):
+        if not force and time.time() - self.last < 20:
+            return
+        self.last = time.time()
+        body = json.dumps({'run': self.run, 'msg': msg}, ensure_ascii=False).encode()
+        try:
+            if self.file_id:
+                self.drive.update_bytes(self.file_id, body, 'application/json')
+            else:
+                self.file_id = self.drive.upload_bytes(body, PROGRESS_NAME, self.folder, 'application/json').get('id')
+        except Exception as e:
+            log('Aviso: no se pudo actualizar el progreso. ' + clean(e)[:120])
+
+    def remove(self):
+        if self.file_id:
+            try:
+                self.drive.delete(self.file_id)
+            except Exception:
+                pass
+
+
+def mb(n):
+    return f'{n / 1048576:.1f} MB'.replace('.', ',')
 
 
 # ---------------------------------------------------------------- FTP → ZIP
@@ -194,9 +241,11 @@ class Ftp:
                 self.connect()
 
     def _listdir(self, path):
-        """[(nombre, es_carpeta)] de una carpeta. MLSD si el servidor lo admite; si no, LIST."""
+        """[(nombre, es_carpeta, huella)] de una carpeta. MLSD si el servidor lo admite; si no, LIST.
+        La huella (tamaño y fecha) sirve para saber si algo ha cambiado sin descargarlo."""
         try:
-            return [(n, f.get('type') == 'dir') for n, f in self.conn.mlsd(path, facts=['type'])
+            return [(n, f.get('type') == 'dir', f.get('size', '') + '@' + f.get('modify', ''))
+                    for n, f in self.conn.mlsd(path, facts=['type', 'size', 'modify'])
                     if f.get('type') in ('file', 'dir')]
         except ftplib.error_perm:
             pass
@@ -211,7 +260,7 @@ class Ftp:
             name = parts[8]
             if name in ('.', '..'):
                 continue
-            out.append((name, line[0] == 'd'))
+            out.append((name, line[0] == 'd', parts[4] + '@' + ' '.join(parts[5:8])))
         return out
 
     def listdir(self, path):
@@ -237,7 +286,7 @@ def excluded(rel, is_dir, patterns):
     return False
 
 
-def backup_files(cfg, work, drive, folder):
+def backup_files(cfg, work, drive, folder, progress):
     root = '/' + cfg['path'].strip('/') if cfg['path'].strip('/') else '/'
     if '..' in root.split('/'):
         raise RuntimeError('Carpeta no permitida.')
@@ -250,42 +299,70 @@ def backup_files(cfg, work, drive, folder):
     except (OSError, ftplib.Error) as e:
         raise RuntimeError(f'No se pudo conectar por FTP: {e}')
     log('Conectado por FTP. Listando archivos…')
+    progress('Archivos: conectado por FTP, revisando si hay cambios…', True)
     try:
         ftp.listdir(root)
     except ftplib.error_perm:
         raise RuntimeError(f'La carpeta {root} no existe en el FTP.')
 
+    # 1) Listado completo (sin descargar nada) y huella: rutas + tamaños + fechas.
+    files, dirs, skipped = [], [], []
+    stack = ['']
+    while stack:
+        rel_dir = stack.pop()
+        remote_dir = root.rstrip('/') + ('/' + rel_dir if rel_dir else '') or '/'
+        try:
+            entries = ftp.listdir(remote_dir)
+        except Exception as e:
+            skipped.append(rel_dir + '/ (' + clean(e)[:80] + ')')
+            continue
+        if rel_dir:
+            dirs.append(rel_dir)
+        for name, is_dir, mark in sorted(entries):
+            rel = (rel_dir + '/' if rel_dir else '') + name
+            if excluded(rel, is_dir, patterns):
+                continue
+            if is_dir:
+                stack.append(rel)
+            else:
+                files.append((rel, remote_dir.rstrip('/') + '/' + name, mark))
+        progress(f'Archivos: revisando si hay cambios… {len(files)} encontrados')
+    h = hashlib.sha256()
+    for rel, _, mark in sorted(files):
+        h.update(f'{rel}\t{mark}\n'.encode('utf-8', 'replace'))
+    for d in sorted(dirs):
+        h.update(f'{d}/\n'.encode('utf-8', 'replace'))
+    for x in sorted(skipped):
+        h.update(f'!{x}\n'.encode('utf-8', 'replace'))
+    manifest = h.hexdigest()
+    log(f'{len(files)} archivos en {len(dirs) + 1} carpetas.')
+
+    if cfg.get('manifest') and cfg['manifest'] == manifest:
+        try:
+            ftp.conn.quit()
+        except Exception:
+            pass
+        log('Sin cambios desde la última copia completa: no se descarga nada.')
+        return {'status': 'same', 'manifest': manifest, 'count': len(files), 'skipped': len(skipped), 'skipped_list': skipped[:50]}
+
+    # 2) Hay cambios (o toca la copia completa semanal): se descarga todo y se sube archivos.zip.
     zip_path = os.path.join(work, 'archivos.zip')
     tmp = os.path.join(work, 'descarga.tmp')
-    count, skipped, total = 0, [], 0
-    stack = ['']
+    count, total = 0, 0
     with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
-        while stack:
-            rel_dir = stack.pop()
-            remote_dir = root.rstrip('/') + ('/' + rel_dir if rel_dir else '') or '/'
+        for d in dirs:
+            z.writestr(d + '/', b'')
+        for rel, remote, _ in files:
             try:
-                entries = ftp.listdir(remote_dir)
+                ftp.download(remote, tmp)
+                z.write(tmp, rel)
+                total += os.path.getsize(tmp)
+                count += 1
+                if count % 250 == 0:
+                    log(f'{count} archivos copiados…')
+                progress(f'Archivos: {count} de {len(files)} descargados ({mb(total)})…')
             except Exception as e:
-                skipped.append(rel_dir + '/ (' + clean(e)[:80] + ')')
-                continue
-            if rel_dir:
-                z.writestr(rel_dir + '/', b'')
-            for name, is_dir in sorted(entries):
-                rel = (rel_dir + '/' if rel_dir else '') + name
-                if excluded(rel, is_dir, patterns):
-                    continue
-                if is_dir:
-                    stack.append(rel)
-                    continue
-                try:
-                    ftp.download(remote_dir.rstrip('/') + '/' + name, tmp)
-                    z.write(tmp, rel)
-                    total += os.path.getsize(tmp)
-                    count += 1
-                    if count % 250 == 0:
-                        log(f'{count} archivos copiados…')
-                except Exception as e:
-                    skipped.append(rel + ' (' + clean(e)[:80] + ')')
+                skipped.append(rel + ' (' + clean(e)[:80] + ')')
     try:
         ftp.conn.quit()
     except Exception:
@@ -295,16 +372,19 @@ def backup_files(cfg, work, drive, folder):
     if count == 0 and skipped:
         raise RuntimeError('No se ha podido descargar ningún archivo.')
     log(f'{count} archivos ({total // 1048576} MB sin comprimir), {len(skipped)} no copiados. Subiendo a Drive…')
-    f = drive.upload_file(zip_path, 'archivos.zip', folder, 'application/zip')
-    size = os.path.getsize(zip_path)
+    zsize = os.path.getsize(zip_path)
+    progress(f'Archivos: {count} descargados. Subiendo archivos.zip ({mb(zsize)}) a Drive…', True)
+    f = drive.upload_file(zip_path, 'archivos.zip', folder, 'application/zip',
+                          lambda pct: progress(f'Archivos: subiendo archivos.zip ({mb(zsize)}) a Drive · {pct}%'))
     os.remove(zip_path)
-    return {'status': 'done', 'id': f.get('id', ''), 'size': size, 'count': count,
+    # Si algún archivo no se pudo descargar, la huella no se guarda: la próxima vez se vuelve a intentar entero.
+    return {'status': 'done', 'id': f.get('id', ''), 'size': zsize, 'count': count, 'manifest': '' if skipped else manifest,
             'skipped': len(skipped), 'skipped_list': skipped[:50]}
 
 
 # ---------------------------------------------------------------- MySQL → SQL.GZ
 
-def backup_db(cfg, work, drive, folder):
+def backup_db(cfg, work, drive, folder, progress):
     version = subprocess.run(['mysqldump', '--version'], capture_output=True, text=True).stdout
     args = ['mysqldump', '-h', cfg['host'], '-P', str(int(cfg['port'])), '-u', cfg['user'],
             '--single-transaction', '--quick', '--skip-lock-tables', '--no-tablespaces',
@@ -315,6 +395,7 @@ def backup_db(cfg, work, drive, folder):
     env = dict(os.environ, MYSQL_PWD=cfg['password'])
     out = os.path.join(work, 'base_datos.sql.gz')
     log('Exportando la base de datos…')
+    progress('Base de datos: exportando con mysqldump…', True)
     with open(os.path.join(work, 'mysqldump.err'), 'w+b') as err:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=err, env=env)
         with gzip.open(out, 'wb', compresslevel=6) as g:
@@ -327,6 +408,7 @@ def backup_db(cfg, work, drive, folder):
         raise RuntimeError('mysqldump: ' + clean(msg.strip() or f'código {rc}'))
     size = os.path.getsize(out)
     log(f'Base de datos exportada ({size // 1024} KB comprimida). Subiendo a Drive…')
+    progress(f'Base de datos: subiendo base_datos.sql.gz ({mb(size)}) a Drive…', True)
     f = drive.upload_file(out, 'base_datos.sql.gz', folder, 'application/gzip')
     os.remove(out)
     return {'status': 'done', 'id': f.get('id', ''), 'size': size}
@@ -361,25 +443,27 @@ def main():
         sys.exit(1)
 
     drive = Drive(g)
+    progress = Progress(drive, data['folder'], data['run'])
     status = {'run': data['run'], 'files': None, 'db': None}
     work = tempfile.mkdtemp(prefix='montacode-')
     try:
         if files:
             try:
-                status['files'] = backup_files(files, work, drive, data['folder'])
+                status['files'] = backup_files(files, work, drive, data['folder'], progress)
                 log('Archivos: correcto.')
             except Exception as e:
                 status['files'] = {'status': 'error', 'error': clean(e)}
                 log('Archivos: error. ' + clean(e))
         if db:
             try:
-                status['db'] = backup_db(db, work, drive, data['folder'])
+                status['db'] = backup_db(db, work, drive, data['folder'], progress)
                 log('Base de datos: correcto.')
             except Exception as e:
                 status['db'] = {'status': 'error', 'error': clean(e)}
                 log('Base de datos: error. ' + clean(e))
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        progress.remove()
         status['finished'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         drive.upload_bytes(json.dumps(status, ensure_ascii=False).encode(), STATUS_NAME, data['folder'], 'application/json')
         log('Resultado enviado al CMS.')

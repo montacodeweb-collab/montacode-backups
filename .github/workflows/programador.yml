@@ -1,0 +1,42 @@
+# Programador de copias de Montacode.
+# Cada noche abre el CMS con un Chrome sin pantalla (InfinityFree solo deja pasar navegadores) y avanza las copias
+# pendientes: exporta las bases de datos y lanza el trabajador de archivos (backup.yml), igual que haría el
+# administrador con el CMS abierto. Si alguna web lleva más de 36 h sin copia correcta, el flujo termina en error
+# y GitHub te avisa por email.
+name: Programador
+run-name: Programador ${{ github.event_name == 'schedule' && 'automático' || 'manual' }}
+
+on:
+  schedule:
+    - cron: '17 1 * * *'   # 02:17 (invierno) / 03:17 (verano) en Madrid: copias del día
+    - cron: '43 6 * * *'   # 07:43 / 08:43: recoge lo que quedara pendiente y comprueba que todo está al día
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: programador
+  cancel-in-progress: false
+
+jobs:
+  programador:
+    # Versión fija: «ubuntu-latest» está pasando a Ubuntu 26 y Playwright aún no instala Chrome ahí.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Preparar Chrome
+        run: |
+          test -f programador.py || { echo "::error::No encuentro programador.py en la raíz del repositorio (debe estar junto a backup_worker.py)."; exit 1; }
+          pip install --quiet --disable-pip-version-check playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Avanzar copias
+        env:
+          ROBOT_URL: ${{ secrets.ROBOT_URL }}
+          ROBOT_KEY: ${{ secrets.ROBOT_KEY }}
+          MAX_MINUTES: '200'
+        run: python programador.py

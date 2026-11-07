@@ -38,5 +38,11 @@ jobs:
         env:
           ROBOT_URL: ${{ secrets.ROBOT_URL }}
           ROBOT_KEY: ${{ secrets.ROBOT_KEY }}
+          # Opcional: avisos de MontaCare por email (p. ej. Gmail: smtp.gmail.com, 465, tu correo y una «contraseña de aplicación»)
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
           MAX_MINUTES: '200'
         run: python programador.py

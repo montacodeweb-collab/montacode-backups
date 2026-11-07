@@ -79,6 +79,8 @@ class Cms:
     def login(self):
         code, j = self.post({'action': 'login', 'key': KEY})
         if code != 200 or not j.get('ok'):
+            if j.get('off'):
+                fail('El programador está desactivado en el CMS (no hay clave). Genera una en «Almacenamiento externo» y guárdala en el secreto ROBOT_KEY.')
             fail('El CMS ha rechazado la clave del programador. Genera una nueva en «Almacenamiento externo» y actualiza el secreto ROBOT_KEY.')
         self.csrf = j['csrf']
 

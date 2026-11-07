@@ -11,14 +11,19 @@ Sale con error (y GitHub avisa por email) si alguna web va con retraso o alguna 
 """
 import json
 import os
+import smtplib
+import ssl
 import sys
 import time
+from email.message import EmailMessage
 
 from playwright.sync_api import sync_playwright, Error as PwError
 
 URL = os.environ.get('ROBOT_URL', '').strip()
 KEY = os.environ.get('ROBOT_KEY', '').strip()
 MAX_MINUTES = int(os.environ.get('MAX_MINUTES', '200'))
+# Avisos de MontaCare por email (opcional): secretos SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS y MAIL_TO.
+SMTP = {k: os.environ.get(k, '').strip() for k in ('SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'MAIL_TO')}
 
 POST_JS = """async (d) => {
   const r = await fetch(location.pathname, {method: 'POST', body: new URLSearchParams(d), credentials: 'same-origin'});
@@ -85,13 +90,43 @@ class Cms:
         self.csrf = j['csrf']
 
     def call(self, action):
+        return self.call_data(action, {})
+
+    def call_data(self, action, extra):
         for _ in range(3):
-            code, j = self.post({'action': action, 'csrf': self.csrf})
+            code, j = self.post({'action': action, 'csrf': self.csrf, **extra})
             if code in (401, 419):  # sesión caducada: se vuelve a entrar
                 self.login()
                 continue
             return code, j
         fail('No se ha podido mantener la sesión con el CMS.')
+
+
+def send_care_mail(cms):
+    """Envía por email los avisos de MontaCare aún no enviados. El contenido nunca se escribe en el registro (es público)."""
+    if not (SMTP['SMTP_HOST'] and SMTP['SMTP_USER'] and SMTP['SMTP_PASS'] and SMTP['MAIL_TO']):
+        return
+    code, d = cms.call('care_digest')
+    if code != 200 or not d.get('ok') or not d.get('lines'):
+        return
+    msg = EmailMessage()
+    msg['Subject'] = d['subject']
+    msg['From'] = SMTP['SMTP_USER']
+    msg['To'] = SMTP['MAIL_TO']
+    msg.set_content('Avisos de MontaCare:\n\n' + '\n'.join(d['lines']) + '\n\nGestiónalos en ' + d['url'] + '\n')
+    port = int(SMTP['SMTP_PORT'] or 465)
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(SMTP['SMTP_HOST'], port, context=ssl.create_default_context(), timeout=30) as s:
+                s.login(SMTP['SMTP_USER'], SMTP['SMTP_PASS']); s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP['SMTP_HOST'], port, timeout=30) as s:
+                s.starttls(context=ssl.create_default_context()); s.login(SMTP['SMTP_USER'], SMTP['SMTP_PASS']); s.send_message(msg)
+    except Exception as e:  # sin detalles: podrían incluir datos del servidor de correo
+        log(f'No se ha podido enviar el email de avisos de MontaCare ({type(e).__name__}). Se reintentará en la próxima pasada.')
+        return
+    cms.call_data('care_mailed', {'ids': ','.join(str(i) for i in d.get('alert_ids', [])), 'request_max': str(d.get('request_max', 0))})
+    log(f'Email de MontaCare enviado ({len(d["lines"])} aviso(s)).')
 
 
 def main():
@@ -138,6 +173,10 @@ def main():
             log(f'Se ha llegado al tiempo máximo ({MAX_MINUTES} min). Lo pendiente lo recogerá la siguiente pasada.')
 
         code, s = cms.call('status')
+        if code == 200 and s.get('ok'):
+            log(f'MontaCare: {s.get("care_new", 0)} aviso(s) de vencimiento nuevo(s), {s.get("care_pending", 0)} pendiente(s) en el CMS.')
+            if s.get('care_mail'):
+                send_care_mail(cms)
         browser.close()
 
     if code != 200 or not s.get('ok'):
